@@ -11,6 +11,13 @@ Install dep:  pip install blessed
 - Press ← or ESC to go back up.
 - Press D to finish and write .gitignore.
 - Press Q to quit without writing.
+
+Performance model
+-----------------
+Directories are "dumb" until expanded: their whitelist status shows as
+unknown (?) and NO rglob walk is performed. A walk only happens when the
+user either expands a dir (→/ENTER) or toggles it (SPACE). A brief
+loading message is shown while the walk runs, then the UI resumes.
 """
 
 import os
@@ -29,13 +36,20 @@ whitelisted: set[str] = set()
 ROOT = Path(".")
 term = Terminal()
 
-# FIX 1 — descendant cache: rglob is only run once per directory path,
-# then reused on every render. Cleared only when toggle() mutates state.
+# Tracks which directory paths have been scanned (rglob walked).
+# Until a path appears here its children are unknown and we show "?".
+_scanned: set[str] = set()
+
+# Descendant cache — populated only after a scan.
 _desc_cache: dict[str, list[str]] = {}
+
+# Dirty-line diff cache for the renderer.
+_screen_cache: dict[int, str] = {}
 
 # ── File-tree helpers ──────────────────────────────────────────────────────────
 
 def list_dir(rel_path: str) -> list[dict]:
+    """One-level listing — cheap, no rglob."""
     base = ROOT / rel_path if rel_path else ROOT
     try:
         entries = sorted(base.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
@@ -43,15 +57,18 @@ def list_dir(rel_path: str) -> list[dict]:
         return []
     result = []
     for e in entries:
-        if e.name in (".git",):
+        if e.name == ".git":
             continue
         rp = str(e.relative_to(ROOT))
         result.append({"name": e.name, "path": rp, "is_dir": e.is_dir()})
     return result
 
 
-def get_descendants(rel_path: str) -> list[str]:
-    """Cached rglob — disk walk happens once per path, not once per keypress."""
+def scan(rel_path: str) -> list[str]:
+    """
+    rglob walk for rel_path — only called on demand (expand or toggle).
+    Result is cached; subsequent calls are instant.
+    """
     if rel_path not in _desc_cache:
         base = ROOT / rel_path
         result = []
@@ -60,31 +77,46 @@ def get_descendants(rel_path: str) -> list[str]:
                 continue
             result.append(str(p.relative_to(ROOT)))
         _desc_cache[rel_path] = result
+    _scanned.add(rel_path)
     return _desc_cache[rel_path]
 
+
+def is_scanned(path: str) -> bool:
+    return path in _scanned
+
+
+# ── Whitelist status (only meaningful after scan) ─────────────────────────────
 
 def is_fully_whitelisted(entry: dict) -> bool:
     if not entry["is_dir"]:
         return entry["path"] in whitelisted
-    desc = get_descendants(entry["path"])
+    if not is_scanned(entry["path"]):
+        return False  # unknown until scanned
+    desc = _desc_cache[entry["path"]]
     return entry["path"] in whitelisted and all(d in whitelisted for d in desc)
 
 
 def is_partially_whitelisted(entry: dict) -> bool:
     if not entry["is_dir"]:
         return False
-    desc = get_descendants(entry["path"])
+    if not is_scanned(entry["path"]):
+        return False  # unknown until scanned
+    desc = _desc_cache[entry["path"]]
     wl_count = sum(1 for d in desc if d in whitelisted)
     total = len(desc) + (1 if entry["path"] in whitelisted else 0)
     return 0 < wl_count < total
 
 
+# ── Toggle ────────────────────────────────────────────────────────────────────
+
 def toggle(entry: dict) -> None:
+    """
+    Toggle whitelist state. Triggers a scan if the dir hasn't been walked yet
+    (caller is responsible for showing the loading message beforehand).
+    """
     path = entry["path"]
-    # Invalidate cache for this path so state is recomputed after mutation
-    _desc_cache.pop(path, None)
     if entry["is_dir"]:
-        desc = get_descendants(path)
+        desc = scan(path)          # scan on first toggle — cached after
         all_paths = [path] + desc
         if all(p in whitelisted for p in all_paths):
             for p in all_paths:
@@ -97,9 +129,10 @@ def toggle(entry: dict) -> None:
             whitelisted.discard(path)
         else:
             whitelisted.add(path)
+    _screen_cache.clear()
 
 
-# ── .gitignore generation ──────────────────────────────────────────────────────
+# ── .gitignore generation ─────────────────────────────────────────────────────
 
 def build_gitignore() -> str:
     lines = [
@@ -121,27 +154,28 @@ def build_gitignore() -> str:
     return "\n".join(lines) + "\n"
 
 
-# ── Rendering helpers ──────────────────────────────────────────────────────────
+# ── Rendering helpers ─────────────────────────────────────────────────────────
 
 def clamp(val: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, val))
 
 
-# FIX 3 — pre-compute escape prefix/suffix strings once at import time.
-# Calling term.green(line) rebuilds escape codes on every call; storing the
-# raw open/close sequences and doing simple concatenation is much faster.
+# Pre-computed escape sequences (fix 3 — avoid per-call overhead).
 _C = {
-    "green":       (term.green,       term.normal),
-    "green_bold":  (term.green_bold,  term.normal),
-    "yellow":      (term.yellow,      term.normal),
-    "yellow_bold": (term.yellow_bold, term.normal),
-    "red":         (term.red,         term.normal),
-    "red_bold":    (term.red_bold,    term.normal),
-    "cyan":        (term.cyan,        term.normal),
-    "cyan_bold":   (term.cyan_bold,   term.normal),
-    "blue":        (term.blue,        term.normal),
-    "white":       (term.white,       term.normal),
+    "green":        (term.green,        term.normal),
+    "green_bold":   (term.green_bold,   term.normal),
+    "yellow":       (term.yellow,       term.normal),
+    "yellow_bold":  (term.yellow_bold,  term.normal),
+    "red":          (term.red,          term.normal),
+    "red_bold":     (term.red_bold,     term.normal),
+    "cyan":         (term.cyan,         term.normal),
+    "cyan_bold":    (term.cyan_bold,    term.normal),
+    "blue":         (term.blue,         term.normal),
+    "white":        (term.white,        term.normal),
+    "magenta":      (term.magenta,      term.normal),
+    "magenta_bold": (term.magenta_bold, term.normal),
 }
+
 
 def _paint(key: str, text: str, reverse: bool = False) -> str:
     open_seq, close_seq = _C[key]
@@ -150,37 +184,49 @@ def _paint(key: str, text: str, reverse: bool = False) -> str:
     return open_seq + text + close_seq
 
 
-# FIX 2 — dirty-line diffing: track what was last written to each row.
-# Only rows whose content has changed are written to stdout, cutting the
-# number of write() calls on a simple cursor move from ~N to just 2.
-_screen_cache: dict[int, str] = {}
-
-
 def _emit_line(row: int, content: str, out: list[str]) -> None:
-    """Append a move+content sequence only if the line changed."""
+    """Only write a row if its content changed (dirty-line diff)."""
     if _screen_cache.get(row) != content:
         out.append(term.move(row, 0) + content)
         _screen_cache[row] = content
 
+
+# ── Loading overlay ───────────────────────────────────────────────────────────
+
+def show_loading(message: str = " Scanning… ") -> None:
+    """
+    Flash a single-line loading message in the footer area immediately.
+    Call this BEFORE the expensive operation; the next render() clears it.
+    """
+    w = term.width or 80
+    h = term.height or 24
+    bar = _paint("magenta_bold", message.center(w - 1))
+    # Write directly — bypass the diff cache so it always appears
+    print(term.move(h - 1, 0) + bar, end="", flush=True)
+    # Invalidate the cached footer row so render() repaints it afterward
+    _screen_cache.pop(h - 1, None)
+
+
+# ── Main render ───────────────────────────────────────────────────────────────
 
 def render(dir_stack: list[str], entries: list[dict], cursor: int) -> None:
     w = term.width or 80
     h = term.height or 24
     out: list[str] = []
 
-    # ── Header ──
+    # Header
     cur_path = dir_stack[-1] if dir_stack else "."
     header = f" gitignore builder  [{cur_path}]"
     _emit_line(0, _paint("cyan_bold", header[:w - 1].ljust(w - 1)), out)
 
-    # ── Help bar ──
+    # Help bar
     help_text = " ↑/↓ Navigate  SPACE Toggle  ENTER/→ Open dir  ← Back  D Done  Q Quit"
     _emit_line(1, _paint("white", help_text[:w - 1].ljust(w - 1)), out)
 
-    # ── Separator ──
+    # Separator
     _emit_line(2, _paint("blue", "─" * (w - 1)), out)
 
-    # ── Entry list ──
+    # Entry list
     list_h = h - 5
     scroll_top = clamp(cursor - list_h // 2, 0, max(0, len(entries) - list_h))
     visible = entries[scroll_top: scroll_top + list_h]
@@ -188,22 +234,31 @@ def render(dir_stack: list[str], entries: list[dict], cursor: int) -> None:
     for i, entry in enumerate(visible):
         real_i = i + scroll_top
 
-        full_wl = is_fully_whitelisted(entry)
-        part_wl = is_partially_whitelisted(entry)
-
-        if entry["is_dir"]:
-            icon = "▷ " if full_wl else ("◈ " if part_wl else "▶ ")
+        if not entry["is_dir"]:
+            # Files: simple present/absent check — always instant
+            if entry["path"] in whitelisted:
+                status, color, color_bold = "✓ ", "green", "green_bold"
+            else:
+                status, color, color_bold = "✗ ", "red", "red_bold"
+            icon, suffix = "  ", ""
+        else:
             suffix = "/"
-        else:
-            icon = "  "
-            suffix = ""
-
-        if full_wl:
-            status, color, color_bold = "✓ ", "green", "green_bold"
-        elif part_wl:
-            status, color, color_bold = "~ ", "yellow", "yellow_bold"
-        else:
-            status, color, color_bold = "✗ ", "red", "red_bold"
+            if not is_scanned(entry["path"]):
+                # Directory not yet walked — show neutral "unknown" state
+                status, color, color_bold = "? ", "magenta", "magenta_bold"
+                icon = "▶ "
+            else:
+                full_wl = is_fully_whitelisted(entry)
+                part_wl = is_partially_whitelisted(entry)
+                if full_wl:
+                    status, color, color_bold = "✓ ", "green", "green_bold"
+                    icon = "▷ "
+                elif part_wl:
+                    status, color, color_bold = "~ ", "yellow", "yellow_bold"
+                    icon = "◈ "
+                else:
+                    status, color, color_bold = "✗ ", "red", "red_bold"
+                    icon = "▶ "
 
         line = f" {status}{icon}{entry['name']}{suffix}"
         line = line[:w - 1].ljust(w - 1)
@@ -215,12 +270,12 @@ def render(dir_stack: list[str], entries: list[dict], cursor: int) -> None:
 
         _emit_line(3 + i, rendered, out)
 
-    # Clear leftover rows below the visible list
+    # Clear leftover rows
     blank = " " * (w - 1)
     for i in range(len(visible), list_h):
         _emit_line(3 + i, blank, out)
 
-    # ── Footer ──
+    # Footer
     footer = f" {len(whitelisted)} path(s) whitelisted  |  D = Done"
     _emit_line(h - 2, _paint("blue", "─" * (w - 1)), out)
     _emit_line(h - 1, _paint("cyan", footer[:w - 1].ljust(w - 1)), out)
@@ -236,7 +291,6 @@ def render_done_dialog(gitignore_text: str) -> bool:
     lines = gitignore_text.splitlines()
 
     out = [term.clear]
-
     title = " Preview .gitignore "
     out.append(term.move(0, 0) + term.cyan_bold(title.center(w - 1)))
     out.append(term.move(1, 0) + term.blue("─" * (w - 1)))
@@ -299,24 +353,30 @@ def run() -> None:
             elif str(key) == " ":
                 entry = entries[cursor]
                 if entry["path"]:
+                    if entry["is_dir"] and not is_scanned(entry["path"]):
+                        # First toggle on an unscanned dir — scan needed
+                        show_loading(f" Scanning {entry['name']}… ")
                     toggle(entry)
-                    _screen_cache.clear()  # state changed — invalidate diff cache
+                    _screen_cache.clear()
 
             elif key.name in ("KEY_RIGHT", "KEY_ENTER") or str(key) in ("\n", "\r", "l"):
                 entry = entries[cursor]
                 if entry["is_dir"] and entry["path"]:
+                    if not is_scanned(entry["path"]):
+                        show_loading(f" Scanning {entry['name']}… ")
+                        scan(entry["path"])   # populate cache before entering
                     cursor_stack.append(cursor)
                     dir_stack.append(entry["path"])
                     entries = list_dir(entry["path"])
                     cursor = 0
-                    _screen_cache.clear()  # new directory view
+                    _screen_cache.clear()
 
             elif key.name in ("KEY_LEFT", "KEY_ESCAPE") or str(key) == "h":
                 if dir_stack:
                     dir_stack.pop()
                     cursor = cursor_stack.pop() if cursor_stack else 0
                     entries = list_dir(current_rel())
-                    _screen_cache.clear()  # returning to parent view
+                    _screen_cache.clear()
 
             elif str(key).lower() == "d":
                 gitignore_text = build_gitignore()
@@ -324,6 +384,7 @@ def run() -> None:
                 if confirmed:
                     result = gitignore_text
                     break
+                _screen_cache.clear()
 
             elif str(key).lower() == "q":
                 break
