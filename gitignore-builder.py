@@ -29,6 +29,10 @@ whitelisted: set[str] = set()
 ROOT = Path(".")
 term = Terminal()
 
+# FIX 1 — descendant cache: rglob is only run once per directory path,
+# then reused on every render. Cleared only when toggle() mutates state.
+_desc_cache: dict[str, list[str]] = {}
+
 # ── File-tree helpers ──────────────────────────────────────────────────────────
 
 def list_dir(rel_path: str) -> list[dict]:
@@ -46,27 +50,30 @@ def list_dir(rel_path: str) -> list[dict]:
     return result
 
 
-def all_descendants(rel_path: str) -> list[str]:
-    base = ROOT / rel_path
-    result = []
-    for p in base.rglob("*"):
-        if ".git" in p.parts:
-            continue
-        result.append(str(p.relative_to(ROOT)))
-    return result
+def get_descendants(rel_path: str) -> list[str]:
+    """Cached rglob — disk walk happens once per path, not once per keypress."""
+    if rel_path not in _desc_cache:
+        base = ROOT / rel_path
+        result = []
+        for p in base.rglob("*"):
+            if ".git" in p.parts:
+                continue
+            result.append(str(p.relative_to(ROOT)))
+        _desc_cache[rel_path] = result
+    return _desc_cache[rel_path]
 
 
 def is_fully_whitelisted(entry: dict) -> bool:
     if not entry["is_dir"]:
         return entry["path"] in whitelisted
-    desc = all_descendants(entry["path"])
+    desc = get_descendants(entry["path"])
     return entry["path"] in whitelisted and all(d in whitelisted for d in desc)
 
 
 def is_partially_whitelisted(entry: dict) -> bool:
     if not entry["is_dir"]:
         return False
-    desc = all_descendants(entry["path"])
+    desc = get_descendants(entry["path"])
     wl_count = sum(1 for d in desc if d in whitelisted)
     total = len(desc) + (1 if entry["path"] in whitelisted else 0)
     return 0 < wl_count < total
@@ -74,8 +81,10 @@ def is_partially_whitelisted(entry: dict) -> bool:
 
 def toggle(entry: dict) -> None:
     path = entry["path"]
+    # Invalidate cache for this path so state is recomputed after mutation
+    _desc_cache.pop(path, None)
     if entry["is_dir"]:
-        desc = all_descendants(path)
+        desc = get_descendants(path)
         all_paths = [path] + desc
         if all(p in whitelisted for p in all_paths):
             for p in all_paths:
@@ -118,34 +127,66 @@ def clamp(val: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, val))
 
 
+# FIX 3 — pre-compute escape prefix/suffix strings once at import time.
+# Calling term.green(line) rebuilds escape codes on every call; storing the
+# raw open/close sequences and doing simple concatenation is much faster.
+_C = {
+    "green":       (term.green,       term.normal),
+    "green_bold":  (term.green_bold,  term.normal),
+    "yellow":      (term.yellow,      term.normal),
+    "yellow_bold": (term.yellow_bold, term.normal),
+    "red":         (term.red,         term.normal),
+    "red_bold":    (term.red_bold,    term.normal),
+    "cyan":        (term.cyan,        term.normal),
+    "cyan_bold":   (term.cyan_bold,   term.normal),
+    "blue":        (term.blue,        term.normal),
+    "white":       (term.white,       term.normal),
+}
+
+def _paint(key: str, text: str, reverse: bool = False) -> str:
+    open_seq, close_seq = _C[key]
+    if reverse:
+        return term.reverse + open_seq + text + close_seq + term.normal
+    return open_seq + text + close_seq
+
+
+# FIX 2 — dirty-line diffing: track what was last written to each row.
+# Only rows whose content has changed are written to stdout, cutting the
+# number of write() calls on a simple cursor move from ~N to just 2.
+_screen_cache: dict[int, str] = {}
+
+
+def _emit_line(row: int, content: str, out: list[str]) -> None:
+    """Append a move+content sequence only if the line changed."""
+    if _screen_cache.get(row) != content:
+        out.append(term.move(row, 0) + content)
+        _screen_cache[row] = content
+
+
 def render(dir_stack: list[str], entries: list[dict], cursor: int) -> None:
     w = term.width or 80
     h = term.height or 24
-
-    out = []
+    out: list[str] = []
 
     # ── Header ──
     cur_path = dir_stack[-1] if dir_stack else "."
     header = f" gitignore builder  [{cur_path}]"
-    out.append(
-        term.move(0, 0)
-        + term.cyan_bold(header[:w - 1].ljust(w - 1))
-    )
+    _emit_line(0, _paint("cyan_bold", header[:w - 1].ljust(w - 1)), out)
 
     # ── Help bar ──
     help_text = " ↑/↓ Navigate  SPACE Toggle  ENTER/→ Open dir  ← Back  D Done  Q Quit"
-    out.append(term.move(1, 0) + term.white(help_text[:w - 1].ljust(w - 1)))
+    _emit_line(1, _paint("white", help_text[:w - 1].ljust(w - 1)), out)
 
     # ── Separator ──
-    out.append(term.move(2, 0) + term.blue("─" * (w - 1)))
+    _emit_line(2, _paint("blue", "─" * (w - 1)), out)
 
     # ── Entry list ──
     list_h = h - 5
     scroll_top = clamp(cursor - list_h // 2, 0, max(0, len(entries) - list_h))
+    visible = entries[scroll_top: scroll_top + list_h]
 
-    for i, entry in enumerate(entries[scroll_top: scroll_top + list_h]):
+    for i, entry in enumerate(visible):
         real_i = i + scroll_top
-        y = 3 + i
 
         full_wl = is_fully_whitelisted(entry)
         part_wl = is_partially_whitelisted(entry)
@@ -158,36 +199,34 @@ def render(dir_stack: list[str], entries: list[dict], cursor: int) -> None:
             suffix = ""
 
         if full_wl:
-            status = "✓ "
-            colorize = term.green
-            colorize_bold = term.green_bold
+            status, color, color_bold = "✓ ", "green", "green_bold"
         elif part_wl:
-            status = "~ "
-            colorize = term.yellow
-            colorize_bold = term.yellow_bold
+            status, color, color_bold = "~ ", "yellow", "yellow_bold"
         else:
-            status = "✗ "
-            colorize = term.red
-            colorize_bold = term.red_bold
+            status, color, color_bold = "✗ ", "red", "red_bold"
 
         line = f" {status}{icon}{entry['name']}{suffix}"
         line = line[:w - 1].ljust(w - 1)
 
         if real_i == cursor:
-            out.append(term.move(y, 0) + term.reverse(colorize_bold(line)))
+            rendered = _paint(color_bold, line, reverse=True)
         else:
-            out.append(term.move(y, 0) + colorize(line))
+            rendered = _paint(color, line)
 
-    # Clear leftover lines below list
-    for i in range(len(entries[scroll_top: scroll_top + list_h]), list_h):
-        out.append(term.move(3 + i, 0) + " " * (w - 1))
+        _emit_line(3 + i, rendered, out)
+
+    # Clear leftover rows below the visible list
+    blank = " " * (w - 1)
+    for i in range(len(visible), list_h):
+        _emit_line(3 + i, blank, out)
 
     # ── Footer ──
     footer = f" {len(whitelisted)} path(s) whitelisted  |  D = Done"
-    out.append(term.move(h - 2, 0) + term.blue("─" * (w - 1)))
-    out.append(term.move(h - 1, 0) + term.cyan(footer[:w - 1].ljust(w - 1)))
+    _emit_line(h - 2, _paint("blue", "─" * (w - 1)), out)
+    _emit_line(h - 1, _paint("cyan", footer[:w - 1].ljust(w - 1)), out)
 
-    print("".join(out), end="", flush=True)
+    if out:
+        print("".join(out), end="", flush=True)
 
 
 def render_done_dialog(gitignore_text: str) -> bool:
@@ -261,6 +300,7 @@ def run() -> None:
                 entry = entries[cursor]
                 if entry["path"]:
                     toggle(entry)
+                    _screen_cache.clear()  # state changed — invalidate diff cache
 
             elif key.name in ("KEY_RIGHT", "KEY_ENTER") or str(key) in ("\n", "\r", "l"):
                 entry = entries[cursor]
@@ -269,12 +309,14 @@ def run() -> None:
                     dir_stack.append(entry["path"])
                     entries = list_dir(entry["path"])
                     cursor = 0
+                    _screen_cache.clear()  # new directory view
 
             elif key.name in ("KEY_LEFT", "KEY_ESCAPE") or str(key) == "h":
                 if dir_stack:
                     dir_stack.pop()
                     cursor = cursor_stack.pop() if cursor_stack else 0
                     entries = list_dir(current_rel())
+                    _screen_cache.clear()  # returning to parent view
 
             elif str(key).lower() == "d":
                 gitignore_text = build_gitignore()
